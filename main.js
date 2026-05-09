@@ -562,7 +562,12 @@ document.querySelectorAll('[data-close]').forEach(btn => {
 });
 // Close on overlay click
 document.querySelectorAll('.modal-overlay').forEach(overlay => {
-  overlay.addEventListener('click', e => { if (e.target === overlay) closeModal(overlay.id); });
+  overlay.addEventListener('click', e => {
+    if (e.target !== overlay) return;
+    if (overlay.id === 'catInputModal') { closeCatInputModal(); return; }
+    if (overlay.id === 'catConfirmModal') { closeCatConfirmModal(); return; }
+    closeModal(overlay.id);
+  });
 });
 // Safety net: guarantee overlays start hidden, avoiding invisible layers blocking clicks
 document.querySelectorAll('.modal-overlay').forEach(overlay => overlay.classList.add('hidden'));
@@ -1585,6 +1590,9 @@ function getCheckoutAddressFields() {
 
 function fillAddressFromUser() {
   if (!currentUser) return;
+  // Geocoding is only needed for delivery fee on the customer-facing menu.
+  // Skip entirely when the admin panel is active to avoid Nominatim rate-limits.
+  if (isAdmin) return;
   const addr = currentUser.user_metadata?.address;
   const cpf = currentUser.user_metadata?.cpf || '';
   if (!addr && !cpf) return;
@@ -4941,6 +4949,63 @@ $('filterProduct').addEventListener('input', renderProductsTable);
 $('filterCategory').addEventListener('change', renderProductsTable);
 
 // ============================================================
+//  CATEGORY MANAGER — Modal helpers
+// ============================================================
+let _catInputResolve = null;
+let _catConfirmResolve = null;
+
+function showCatInputModal({ title, label, placeholder, defaultValue = '' }) {
+  return new Promise(resolve => {
+    _catInputResolve = resolve;
+    $('catInputTitle').textContent = title;
+    $('catInputLabel').textContent = label;
+    $('catInputField').placeholder = placeholder || '';
+    $('catInputField').value = defaultValue;
+    $('catInputError').textContent = '';
+    $('catInputError').classList.add('hidden');
+    $('catInputModal').classList.remove('hidden');
+    document.body.style.overflow = 'hidden';
+    setTimeout(() => $('catInputField').focus(), 80);
+
+    $('catInputConfirm').onclick = () => {
+      const val = $('catInputField').value.trim();
+      if (!val) {
+        $('catInputError').textContent = 'Campo obrigatório';
+        $('catInputError').classList.remove('hidden');
+        return;
+      }
+      closeCatInputModal();
+      resolve(val);
+    };
+    $('catInputField').onkeydown = (e) => { if (e.key === 'Enter') $('catInputConfirm').click(); };
+  });
+}
+
+window.closeCatInputModal = function() {
+  $('catInputModal').classList.add('hidden');
+  document.body.style.overflow = '';
+  if (_catInputResolve) { _catInputResolve(null); _catInputResolve = null; }
+};
+
+function showCatConfirmModal({ title, message, confirmLabel = 'Excluir' }) {
+  return new Promise(resolve => {
+    _catConfirmResolve = resolve;
+    $('catConfirmTitle').textContent = title;
+    $('catConfirmMessage').textContent = message;
+    $('catConfirmOk').textContent = confirmLabel;
+    $('catConfirmModal').classList.remove('hidden');
+    document.body.style.overflow = 'hidden';
+    $('catConfirmOk').onclick = () => { closeCatConfirmModal(); resolve(true); };
+  });
+}
+
+window.closeCatConfirmModal = function() {
+  $('catConfirmModal').classList.add('hidden');
+  document.body.style.overflow = '';
+  if (_catConfirmResolve) { _catConfirmResolve(false); _catConfirmResolve = null; }
+};
+
+// ============================================================
 //  CATEGORY MANAGER
 // ============================================================
 $('btnToggleCatManager')?.addEventListener('click', () => {
@@ -4949,41 +5014,46 @@ $('btnToggleCatManager')?.addEventListener('click', () => {
   if (!hidden) renderCategoryManager();
 });
 
-$('btnCreateCategory')?.addEventListener('click', () => {
-  const name = prompt('Nome da nova categoria:');
-  if (!name?.trim()) return;
-  const exists = allProducts.some(p => p.categoria?.toLowerCase() === name.trim().toLowerCase());
+$('btnCreateCategory')?.addEventListener('click', async () => {
+  const name = await showCatInputModal({
+    title: 'Nova Categoria',
+    label: 'Nome da categoria',
+    placeholder: 'Ex: Entradas, Sobremesas...',
+  });
+  if (!name) return;
+  const exists = allProducts.some(p => p.categoria?.toLowerCase() === name.toLowerCase());
   if (exists) { showToast('Já existe uma categoria com esse nome', 'error'); return; }
-  // Salva a nova categoria na order config (sem produtos por enquanto)
-  saveCatOrderWithNew(name.trim());
-});
-
-async function saveCatOrderWithNew(newCatName) {
-  // Pega a ordem atual do site_config
   let order = await loadCatOrderFromConfig();
-  if (!order.includes(newCatName)) order.push(newCatName);
+  if (!order.includes(name)) order.push(name);
   await saveCatOrderToConfig(order);
   renderCategoryManager();
-  showToast(`Categoria "${newCatName}" criada. Adicione produtos a ela.`, 'success');
-}
+  showToast(`Categoria "${name}" criada!`, 'success');
+});
 
 async function loadCatOrderFromConfig() {
   try {
-    const { data } = await sb.from('site_config').select('value').eq('key', 'category_order').single();
+    const { data } = await sb.from('site_config').select('value').eq('key', 'category_order').maybeSingle();
     if (data?.value) return JSON.parse(data.value);
   } catch (_) {}
-  // Fallback: order das categorias existentes
   return [...new Set(allProducts.map(p => p.categoria).filter(Boolean))];
 }
 
+async function saveSiteConfigKey(key, value) {
+  const { error: updErr } = await sb.from('site_config').update({ value }).eq('key', key);
+  if (updErr) {
+    // Row doesn't exist yet — insert it
+    await sb.from('site_config').insert({ key, value });
+  }
+}
+
 async function saveCatOrderToConfig(order) {
-  await sb.from('site_config').upsert({ key: 'category_order', value: JSON.stringify(order) }, { onConflict: 'key' });
+  await saveSiteConfigKey('category_order', JSON.stringify(order));
 }
 
 async function loadSubcatOrderFromConfig(catName) {
   const key = 'subcat_order_' + normalizeCategoryKeyAdmin(catName);
   try {
-    const { data } = await sb.from('site_config').select('value').eq('key', key).single();
+    const { data } = await sb.from('site_config').select('value').eq('key', key).maybeSingle();
     if (data?.value) return JSON.parse(data.value);
   } catch (_) {}
   return [];
@@ -4991,7 +5061,7 @@ async function loadSubcatOrderFromConfig(catName) {
 
 async function saveSubcatOrderToConfig(catName, order) {
   const key = 'subcat_order_' + normalizeCategoryKeyAdmin(catName);
-  await sb.from('site_config').upsert({ key, value: JSON.stringify(order) }, { onConflict: 'key' });
+  await saveSiteConfigKey(key, JSON.stringify(order));
 }
 
 function normalizeCategoryKeyAdmin(name) {
@@ -5003,15 +5073,11 @@ async function renderCategoryManager() {
   list.innerHTML = '<div class="empty-state"><i class="fas fa-spinner fa-spin"></i><p>Carregando...</p></div>';
 
   const catOrder = await loadCatOrderFromConfig();
-
-  // Build category set: combine saved order + products that exist but aren't in order
   const productCats = [...new Set(allProducts.map(p => p.categoria).filter(Boolean))];
   const allCats = [...catOrder, ...productCats.filter(c => !catOrder.includes(c))];
-  // Remove cats in order that don't have products AND aren't in productCats
-  // (keep newly created cats even if no products yet)
 
   if (!allCats.length) {
-    list.innerHTML = '<div class="empty-state"><i class="fas fa-tags"></i><p>Nenhuma categoria encontrada</p></div>';
+    list.innerHTML = '<div class="empty-state"><i class="fas fa-layer-group"></i><p>Nenhuma categoria encontrada</p></div>';
     return;
   }
 
@@ -5021,7 +5087,6 @@ async function renderCategoryManager() {
     const prods = allProducts.filter(p => p.categoria === cat);
     const subcats = [...new Set(prods.map(p => p.subcategoria).filter(Boolean))];
 
-    // Load subcat order for this category
     const subcatOrder = await loadSubcatOrderFromConfig(cat);
     subcats.sort((a, b) => {
       const ai = subcatOrder.indexOf(a);
@@ -5030,54 +5095,75 @@ async function renderCategoryManager() {
     });
 
     const catKey = normalizeCategoryKeyAdmin(cat);
-    const row = document.createElement('div');
-    row.className = 'cat-manager-row';
-    row.dataset.cat = cat;
-    row.dataset.idx = i;
-    row.innerHTML = `
-      <div class="cat-manager-row__head">
-        <div class="cat-manager-row__reorder">
-          <button class="btn-icon" title="Subir" onclick="moveCat('${escapeHtml(cat)}', -1)" ${i === 0 ? 'disabled' : ''}><i class="fas fa-chevron-up"></i></button>
-          <button class="btn-icon" title="Descer" onclick="moveCat('${escapeHtml(cat)}', 1)" ${i === allCats.length - 1 ? 'disabled' : ''}><i class="fas fa-chevron-down"></i></button>
+    const canDelete = prods.length === 0;
+    const hasSubcats = subcats.length > 0;
+
+    const card = document.createElement('div');
+    card.className = 'cat-card';
+    card.dataset.cat = cat;
+
+    card.innerHTML = `
+      <div class="cat-card__head">
+        <div class="cat-card__arrows">
+          <button class="cat-arrow" title="Subir" onclick="moveCat('${escapeHtml(cat)}', -1)" ${i === 0 ? 'disabled' : ''}><i class="fas fa-chevron-up"></i></button>
+          <button class="cat-arrow" title="Descer" onclick="moveCat('${escapeHtml(cat)}', 1)" ${i === allCats.length - 1 ? 'disabled' : ''}><i class="fas fa-chevron-down"></i></button>
         </div>
-        <span class="cat-manager-row__name">${escapeHtml(cat)}</span>
-        <span class="cat-manager-row__count">${prods.length} produto${prods.length !== 1 ? 's' : ''}</span>
-        <div class="cat-manager-row__actions">
-          <button class="btn btn--outline-sm btn--sm" onclick="renameCat('${escapeHtml(cat)}')"><i class="fas fa-edit"></i> Renomear</button>
-          <button class="btn btn--danger btn--sm" onclick="deleteCat('${escapeHtml(cat)}')" ${prods.length > 0 ? 'disabled title="Mova os produtos antes de excluir"' : ''}><i class="fas fa-trash"></i></button>
-          ${subcats.length > 0 ? `<button class="btn btn--outline-sm btn--sm" onclick="toggleSubcatSection('${catKey}')"><i class="fas fa-list"></i> Subcategorias (${subcats.length})</button>` : `<button class="btn btn--outline-sm btn--sm" onclick="addSubcatPrompt('${escapeHtml(cat)}')"><i class="fas fa-plus"></i> Subcat.</button>`}
+        <div class="cat-card__dot"></div>
+        <span class="cat-card__name">${escapeHtml(cat)}</span>
+        <span class="cat-card__badge"><i class="fas fa-box"></i> ${prods.length} produto${prods.length !== 1 ? 's' : ''}</span>
+        <div class="cat-card__actions">
+          <button class="cat-btn cat-btn--ghost" onclick="renameCat('${escapeHtml(cat)}')">
+            <i class="fas fa-pen"></i> Renomear
+          </button>
+          ${hasSubcats
+            ? `<button class="cat-btn cat-btn--expand" id="expandBtn_${catKey}" onclick="toggleSubcatSection('${catKey}')">
+                <i class="fas fa-list"></i> Subcats (${subcats.length}) <i class="fas fa-chevron-down expand-arrow"></i>
+               </button>`
+            : `<button class="cat-btn cat-btn--ghost" onclick="addSubcatPrompt('${escapeHtml(cat)}')">
+                <i class="fas fa-plus"></i> Subcategoria
+               </button>`
+          }
+          <button class="cat-btn cat-btn--danger" onclick="deleteCat('${escapeHtml(cat)}')"
+            ${!canDelete ? 'disabled title="Mova ou exclua os produtos antes de excluir a categoria"' : ''}>
+            <i class="fas fa-trash-alt"></i>
+          </button>
         </div>
       </div>
-      ${subcats.length > 0 ? `
-      <div class="cat-manager-subcats hidden" id="subcats_${catKey}">
+      ${hasSubcats ? `
+      <div class="cat-card__subcats hidden" id="subcats_${catKey}">
         ${subcats.map((s, si) => `
-          <div class="subcat-manager-row">
-            <div class="cat-manager-row__reorder">
-              <button class="btn-icon" onclick="moveSubcat('${escapeHtml(cat)}','${escapeHtml(s)}',-1)" ${si === 0 ? 'disabled' : ''}><i class="fas fa-chevron-up"></i></button>
-              <button class="btn-icon" onclick="moveSubcat('${escapeHtml(cat)}','${escapeHtml(s)}',1)" ${si === subcats.length - 1 ? 'disabled' : ''}><i class="fas fa-chevron-down"></i></button>
+          <div class="subcat-row">
+            <div class="cat-card__arrows">
+              <button class="cat-arrow" onclick="moveSubcat('${escapeHtml(cat)}','${escapeHtml(s)}',-1)" ${si === 0 ? 'disabled' : ''}><i class="fas fa-chevron-up"></i></button>
+              <button class="cat-arrow" onclick="moveSubcat('${escapeHtml(cat)}','${escapeHtml(s)}',1)" ${si === subcats.length - 1 ? 'disabled' : ''}><i class="fas fa-chevron-down"></i></button>
             </div>
-            <span class="subcat-manager-row__name">${escapeHtml(s)}</span>
-            <span class="cat-manager-row__count">${prods.filter(p => p.subcategoria === s).length} prod.</span>
-            <div class="cat-manager-row__actions">
-              <button class="btn btn--outline-sm btn--sm" onclick="renameSubcat('${escapeHtml(cat)}','${escapeHtml(s)}')"><i class="fas fa-edit"></i></button>
-              <button class="btn btn--danger btn--sm" onclick="deleteSubcat('${escapeHtml(cat)}','${escapeHtml(s)}')"><i class="fas fa-trash"></i></button>
+            <div class="subcat-row__dot"></div>
+            <span class="subcat-row__name">${escapeHtml(s)}</span>
+            <span class="subcat-row__count">${prods.filter(p => p.subcategoria === s).length} prod.</span>
+            <div class="subcat-row__actions">
+              <button class="cat-btn cat-btn--icon" title="Renomear" onclick="renameSubcat('${escapeHtml(cat)}','${escapeHtml(s)}')"><i class="fas fa-pen"></i></button>
+              <button class="cat-btn cat-btn--danger cat-btn--icon" title="Excluir" onclick="deleteSubcat('${escapeHtml(cat)}','${escapeHtml(s)}')"><i class="fas fa-trash-alt"></i></button>
             </div>
           </div>`).join('')}
-        <button class="btn btn--outline-sm btn--sm" style="margin-top:8px;" onclick="addSubcatPrompt('${escapeHtml(cat)}')"><i class="fas fa-plus"></i> Nova Subcategoria</button>
+        <button class="cat-card__add-subcat" onclick="addSubcatPrompt('${escapeHtml(cat)}')">
+          <i class="fas fa-plus"></i> Nova Subcategoria
+        </button>
       </div>` : ''}
     `;
-    list.appendChild(row);
+    list.appendChild(card);
   }
 }
 
 window.toggleSubcatSection = function(catKey) {
   const el = document.getElementById('subcats_' + catKey);
-  el?.classList.toggle('hidden');
+  const btn = document.getElementById('expandBtn_' + catKey);
+  if (!el) return;
+  el.classList.toggle('hidden');
+  btn?.classList.toggle('open');
 };
 
 window.moveCat = async function(cat, dir) {
   let order = await loadCatOrderFromConfig();
-  // Ensure all current cats are in order
   const productCats = [...new Set(allProducts.map(p => p.categoria).filter(Boolean))];
   productCats.forEach(c => { if (!order.includes(c)) order.push(c); });
   const idx = order.indexOf(cat);
@@ -5090,26 +5176,27 @@ window.moveCat = async function(cat, dir) {
 };
 
 window.renameCat = async function(oldName) {
-  const newName = prompt(`Novo nome para "${oldName}":`, oldName);
-  if (!newName?.trim() || newName.trim() === oldName) return;
-  const trimmed = newName.trim();
-  if (allProducts.some(p => p.categoria?.toLowerCase() === trimmed.toLowerCase() && p.categoria !== oldName)) {
-    showToast('Já existe uma categoria com esse nome', 'error');
-    return;
+  const newName = await showCatInputModal({
+    title: 'Renomear Categoria',
+    label: `Novo nome para "${oldName}"`,
+    placeholder: 'Digite o novo nome...',
+    defaultValue: oldName,
+  });
+  if (!newName || newName === oldName) return;
+  if (allProducts.some(p => p.categoria?.toLowerCase() === newName.toLowerCase() && p.categoria !== oldName)) {
+    showToast('Já existe uma categoria com esse nome', 'error'); return;
   }
   try {
-    const { error } = await sb.from('produtos').update({ categoria: trimmed }).eq('categoria', oldName);
+    const { error } = await sb.from('produtos').update({ categoria: newName }).eq('categoria', oldName);
     if (error) throw error;
-    // Update config order
     let order = await loadCatOrderFromConfig();
     const idx = order.indexOf(oldName);
-    if (idx !== -1) order[idx] = trimmed;
+    if (idx !== -1) order[idx] = newName;
     await saveCatOrderToConfig(order);
-    // Move subcat order config
     const oldSubcatOrder = await loadSubcatOrderFromConfig(oldName);
-    if (oldSubcatOrder.length) await saveSubcatOrderToConfig(trimmed, oldSubcatOrder);
+    if (oldSubcatOrder.length) await saveSubcatOrderToConfig(newName, oldSubcatOrder);
     await loadProducts();
-    showToast(`Categoria renomeada para "${trimmed}"`, 'success');
+    showToast(`Categoria renomeada para "${newName}"`, 'success');
   } catch (err) {
     showToast('Erro ao renomear: ' + err.message, 'error');
   }
@@ -5118,10 +5205,14 @@ window.renameCat = async function(oldName) {
 window.deleteCat = async function(cat) {
   const prods = allProducts.filter(p => p.categoria === cat);
   if (prods.length > 0) {
-    showToast('Mova ou exclua todos os produtos antes de excluir a categoria', 'error');
-    return;
+    showToast('Mova ou exclua todos os produtos antes de excluir a categoria', 'error'); return;
   }
-  if (!confirm(`Excluir categoria "${cat}"?`)) return;
+  const ok = await showCatConfirmModal({
+    title: 'Excluir Categoria',
+    message: `Tem certeza que deseja excluir a categoria "${cat}"? Essa ação não pode ser desfeita.`,
+    confirmLabel: 'Excluir',
+  });
+  if (!ok) return;
   try {
     let order = await loadCatOrderFromConfig();
     order = order.filter(c => c !== cat);
@@ -5134,22 +5225,23 @@ window.deleteCat = async function(cat) {
 };
 
 window.addSubcatPrompt = async function(cat) {
-  const name = prompt(`Nova subcategoria em "${cat}":`);
-  if (!name?.trim()) return;
-  const trimmed = name.trim();
-  const exists = allProducts.some(p => p.categoria === cat && p.subcategoria?.toLowerCase() === trimmed.toLowerCase());
+  const name = await showCatInputModal({
+    title: 'Nova Subcategoria',
+    label: `Subcategoria em "${cat}"`,
+    placeholder: 'Ex: Salgada, Cervejas, 2 Pessoas...',
+  });
+  if (!name) return;
+  const exists = allProducts.some(p => p.categoria === cat && p.subcategoria?.toLowerCase() === name.toLowerCase());
   if (exists) { showToast('Subcategoria já existe', 'error'); return; }
-  // Append to subcat order
   const order = await loadSubcatOrderFromConfig(cat);
-  if (!order.includes(trimmed)) order.push(trimmed);
+  if (!order.includes(name)) order.push(name);
   await saveSubcatOrderToConfig(cat, order);
   renderCategoryManager();
-  showToast(`Subcategoria "${trimmed}" criada em "${cat}". Edite os produtos para atribuí-la.`, 'success');
+  showToast(`Subcategoria "${name}" criada!`, 'success');
 };
 
 window.moveSubcat = async function(cat, sub, dir) {
   let order = await loadSubcatOrderFromConfig(cat);
-  // Ensure all subcats in products are in order
   const productSubs = [...new Set(allProducts.filter(p => p.categoria === cat).map(p => p.subcategoria).filter(Boolean))];
   productSubs.forEach(s => { if (!order.includes(s)) order.push(s); });
   const idx = order.indexOf(sub);
@@ -5162,21 +5254,25 @@ window.moveSubcat = async function(cat, sub, dir) {
 };
 
 window.renameSubcat = async function(cat, oldSub) {
-  const newSub = prompt(`Novo nome para subcategoria "${oldSub}":`, oldSub);
-  if (!newSub?.trim() || newSub.trim() === oldSub) return;
-  const trimmed = newSub.trim();
+  const newSub = await showCatInputModal({
+    title: 'Renomear Subcategoria',
+    label: `Novo nome para "${oldSub}"`,
+    placeholder: 'Digite o novo nome...',
+    defaultValue: oldSub,
+  });
+  if (!newSub || newSub === oldSub) return;
   try {
     const { error } = await sb.from('produtos')
-      .update({ subcategoria: trimmed })
+      .update({ subcategoria: newSub })
       .eq('categoria', cat)
       .eq('subcategoria', oldSub);
     if (error) throw error;
     const order = await loadSubcatOrderFromConfig(cat);
     const idx = order.indexOf(oldSub);
-    if (idx !== -1) order[idx] = trimmed;
+    if (idx !== -1) order[idx] = newSub;
     await saveSubcatOrderToConfig(cat, order);
     await loadProducts();
-    showToast(`Subcategoria renomeada para "${trimmed}"`, 'success');
+    showToast(`Subcategoria renomeada para "${newSub}"`, 'success');
   } catch (err) {
     showToast('Erro ao renomear: ' + err.message, 'error');
   }
@@ -5184,13 +5280,15 @@ window.renameSubcat = async function(cat, oldSub) {
 
 window.deleteSubcat = async function(cat, sub) {
   const count = allProducts.filter(p => p.categoria === cat && p.subcategoria === sub).length;
-  if (!confirm(`Excluir subcategoria "${sub}"? ${count > 0 ? count + ' produto(s) perderão a subcategoria.' : ''}`)) return;
+  const ok = await showCatConfirmModal({
+    title: 'Excluir Subcategoria',
+    message: `Excluir "${sub}"?${count > 0 ? ` ${count} produto(s) perderão a subcategoria.` : ''}`,
+    confirmLabel: 'Excluir',
+  });
+  if (!ok) return;
   try {
     if (count > 0) {
-      const { error } = await sb.from('produtos')
-        .update({ subcategoria: null })
-        .eq('categoria', cat)
-        .eq('subcategoria', sub);
+      const { error } = await sb.from('produtos').update({ subcategoria: null }).eq('categoria', cat).eq('subcategoria', sub);
       if (error) throw error;
     }
     let order = await loadSubcatOrderFromConfig(cat);
